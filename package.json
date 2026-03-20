@@ -1,0 +1,1 @@
+{"name":"ronnascanner-api","version":"1.0.0","scripts":{"dev":"vercel dev","deploy":"vercel --prod"},"dependencies":{"firebase-admin":"^12.0.0","stripe":"^14.0.0","@anthropic-ai/sdk":"^0.24.0"}}
