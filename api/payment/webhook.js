@@ -1,155 +1,79 @@
 /**
- * /api/payment/webhook.js
- * Stripe webhook — updates Firebase Firestore on subscription events
- * Raw body required: set bodyParser: false in vercel.json for this route
+ * POST /api/payment/webhook — Stripe -> Firestore entitlement sync.
+ *
+ * Raw body: the signature is computed over the exact bytes Stripe sent, so the
+ * body is read from the request stream (rigor-api's method). @vercel/node only
+ * parses req.body lazily when it is READ, so this handler must not touch req.body
+ * unless it is already a Buffer (and is deliberately NOT wrapped in withHttp, which
+ * parses the body). No vercel.json bodyParser setting is needed (that key is
+ * invalid in vercel.json and broke the build).
+ *
+ * 400 for a missing/invalid signature (never 2xx), 500 when applying a verified
+ * event fails (Stripe retries), 200 otherwise. A redelivered event is acknowledged
+ * without being applied again (lib/stripeEvents.js dedupe). No CORS: Stripe calls
+ * this server-to-server.
  */
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-const admin = require("../lib/firebase");
+const { handleStripeEvent } = require("../lib/stripeEvents");
+const { getStripe } = require("../lib/stripe");
 
-const db = admin.firestore();
-const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const MAX_WEBHOOK_BYTES = 512 * 1024;
+
+function readRawBody(req) {
+  if (Buffer.isBuffer(req.rawBody)) return Promise.resolve(req.rawBody);
+  if (typeof req.rawBody === "string") return Promise.resolve(Buffer.from(req.rawBody));
+  // @vercel/node (addHelpers -> readBody -> restoreBody) buffers the body and
+  // replays the exact bytes into the request stream, so the stream is readable here.
+  // If something already drained it, never hang: only an unparsed Buffer/string is
+  // usable; a parsed object cannot be verified byte-for-byte (-> 400).
+  if (req.readableEnded) {
+    if (Buffer.isBuffer(req.body)) return Promise.resolve(req.body);
+    if (typeof req.body === "string") return Promise.resolve(Buffer.from(req.body));
+    return Promise.reject(new Error("raw body unavailable"));
+  }
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", c => {
+      const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      size += b.length;
+      if (size > MAX_WEBHOOK_BYTES) { reject(Object.assign(new Error("too large"), { status: 413 })); return; }
+      chunks.push(b);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+}
 
 module.exports = async (req, res) => {
-  if (req.method !== "POST") return res.status(405).end();
+  res.removeHeader?.("X-Powered-By");
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "method_not_allowed", message: `Method ${req.method} not allowed.` });
+  }
+  const stripe = getStripe();
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!stripe || !secret) return res.status(503).json({ error: "not_configured", message: "Webhook is not configured." });
 
-  const sig = req.headers["stripe-signature"];
   let event;
-
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, WEBHOOK_SECRET);
+    const raw = await readRawBody(req);
+    const sig = req.headers["stripe-signature"];
+    if (!sig) throw new Error("missing signature");
+    event = stripe.webhooks.constructEvent(raw, sig, secret);
   } catch (err) {
-    console.error("Webhook signature error:", err.message);
-    return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+    if (err && err.status === 413) return res.status(413).json({ error: "payload_too_large", message: "Request body is too large." });
+    console.error("webhook signature error:", err && err.message);
+    return res.status(400).json({ error: "invalid_signature", message: "Webhook signature verification failed." });
   }
 
   try {
-    switch (event.type) {
-      // ── Checkout completed ─────────────────────────────────────────────────
-      case "checkout.session.completed": {
-        const session = event.data.object;
-        const userId = session.metadata?.userId;
-        if (!userId || userId === "anonymous") break;
-
-        // Get subscription details
-        const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        const priceId = subscription.items.data[0]?.price?.id;
-        const plan = resolvePlan(priceId);
-
-        await db.collection("subscriptions").doc(userId).set({
-          plan,
-          status: "active",
-          stripeCustomerId: session.customer,
-          stripeSubscriptionId: session.subscription,
-          stripePriceId: priceId,
-          currentPeriodEnd: new Date(subscription.current_period_end * 1000).toISOString(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await logEvent(userId, "subscription_created", { plan });
-        break;
-      }
-
-      // ── Subscription updated ───────────────────────────────────────────────
-      case "customer.subscription.updated": {
-        const sub = event.data.object;
-        const userId = await getUserIdFromCustomer(sub.customer);
-        if (!userId) break;
-
-        const priceId = sub.items.data[0]?.price?.id;
-        const plan = resolvePlan(priceId);
-        const status = sub.status; // active, past_due, canceled, etc.
-
-        await db.collection("subscriptions").doc(userId).set({
-          plan: status === "active" ? plan : "free",
-          status,
-          stripePriceId: priceId,
-          currentPeriodEnd: new Date(sub.current_period_end * 1000).toISOString(),
-          cancelAtPeriodEnd: sub.cancel_at_period_end,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await logEvent(userId, "subscription_updated", { plan, status });
-        break;
-      }
-
-      // ── Subscription deleted / cancelled ──────────────────────────────────
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-        const userId = await getUserIdFromCustomer(sub.customer);
-        if (!userId) break;
-
-        await db.collection("subscriptions").doc(userId).set({
-          plan: "free",
-          status: "canceled",
-          canceledAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await logEvent(userId, "subscription_canceled", {});
-        break;
-      }
-
-      // ── Invoice paid ──────────────────────────────────────────────────────
-      case "invoice.paid": {
-        const invoice = event.data.object;
-        const userId = await getUserIdFromCustomer(invoice.customer);
-        if (!userId) break;
-
-        await db.collection("subscriptions").doc(userId).set({
-          status: "active",
-          lastPaymentDate: new Date(invoice.status_transitions.paid_at * 1000).toISOString(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-        break;
-      }
-
-      // ── Payment failed ─────────────────────────────────────────────────────
-      case "invoice.payment_failed": {
-        const invoice = event.data.object;
-        const userId = await getUserIdFromCustomer(invoice.customer);
-        if (!userId) break;
-
-        await db.collection("subscriptions").doc(userId).set({
-          status: "past_due",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-
-        await logEvent(userId, "payment_failed", { invoiceId: invoice.id });
-        break;
-      }
-
-      default:
-        console.log(`Unhandled event: ${event.type}`);
-    }
-
-    res.status(200).json({ received: true });
+    const result = await handleStripeEvent(event);
+    return res.status(200).json({ received: true, ...(result.duplicate ? { duplicate: true } : {}) });
   } catch (err) {
-    console.error("Webhook handler error:", err);
-    res.status(500).json({ error: err.message });
+    console.error("webhook handler error:", err);
+    return res.status(500).json({ error: "webhook_failed", message: "Webhook handling failed." });
   }
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function resolvePlan(priceId) {
-  const proPriceIds = (process.env.STRIPE_PRO_PRICE_IDS || "").split(",").map(s => s.trim());
-  const teamPriceIds = (process.env.STRIPE_TEAM_PRICE_IDS || "").split(",").map(s => s.trim());
-  if (teamPriceIds.includes(priceId)) return "team";
-  if (proPriceIds.includes(priceId)) return "pro";
-  return "pro"; // default to pro for any paid plan
-}
-
-async function getUserIdFromCustomer(customerId) {
-  const snap = await db.collection("subscriptions")
-    .where("stripeCustomerId", "==", customerId)
-    .limit(1)
-    .get();
-  if (snap.empty) return null;
-  return snap.docs[0].id; // doc ID is userId
-}
-
-async function logEvent(userId, type, data) {
-  await db.collection("payment_events").add({
-    userId, type, data,
-    createdAt: admin.firestore.FieldValue.serverTimestamp()
-  });
-}
+module.exports.readRawBody = readRawBody;

@@ -1,1 +1,14 @@
-{"name":"ronnascanner-api","version":"1.0.0","scripts":{"dev":"vercel dev","deploy":"vercel --prod"},"dependencies":{"firebase-admin":"^12.0.0","stripe":"^14.0.0","@anthropic-ai/sdk":"^0.24.0"}}
+{
+  "name": "ronnascanner-api",
+  "version": "1.1.0",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "vercel dev",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "stripe": "^14.0.0"
+  }
+}

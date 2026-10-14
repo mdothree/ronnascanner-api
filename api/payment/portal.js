@@ -1,32 +1,35 @@
 /**
- * /api/payment/portal.js
- * Opens Stripe Customer Portal for subscription management
+ * POST /api/payment/portal — Stripe billing portal for the CALLER's own account.
+ * Auth: verified Firebase ID token. The subscription is read from
+ * subscriptions/{req.user.uid}; a body/query userId naming another account is 403
+ * (this closes the IDOR the audit found). Return URL: the allowlisted Origin, else
+ * https://ronnascanner.com/. Response: { url }.
  */
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const admin = require("../lib/firebase");
+const { withHttp } = require("../_middleware/http");
+const { withCors, ALLOWED_ORIGINS, APEX } = require("../_middleware/cors");
+const { requireAuth, rejectForeignUserId } = require("../_middleware/auth");
+const { withRateLimit } = require("../_middleware/limits");
+const { getStripe } = require("../lib/stripe");
 
-module.exports = async (req, res) => {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+async function handler(req, res) {
+  if (rejectForeignUserId(req, res)) return;
+  const stripe = getStripe();
+  if (!stripe) return res.status(503).json({ error: "not_configured", message: "Billing is not open yet." });
 
-  try {
-    const { userId } = req.body;
-    if (!userId) return res.status(400).json({ error: "Missing userId" });
-
-    const db = admin.firestore();
-    const subSnap = await db.collection("subscriptions").doc(userId).get();
-    if (!subSnap.exists) return res.status(404).json({ error: "No subscription found" });
-
-    const { stripeCustomerId } = subSnap.data();
-    if (!stripeCustomerId) return res.status(400).json({ error: "No Stripe customer linked" });
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: stripeCustomerId,
-      return_url: req.headers.origin + "/"
-    });
-
-    res.status(200).json({ url: session.url });
-  } catch (err) {
-    console.error("portal error:", err);
-    res.status(500).json({ error: err.message });
+  const snap = await admin.firestore().collection("subscriptions").doc(req.user.uid).get();
+  const data = snap.exists ? snap.data() : null;
+  if (!data || !data.stripeCustomerId) {
+    return res.status(404).json({ error: "not_found", message: "No subscription found for this account." });
   }
-};
+  const origin = req.headers.origin;
+  const session = await stripe.billingPortal.sessions.create({
+    customer: data.stripeCustomerId,
+    return_url: (origin && ALLOWED_ORIGINS.has(origin) ? origin : APEX) + "/"
+  });
+  return res.status(200).json({ url: session.url });
+}
+
+module.exports = withHttp(withCors(requireAuth(withRateLimit(handler, {
+  name: "portal", windows: [{ windowMs: 60 * 1000, max: 10 }]
+}))));

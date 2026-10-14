@@ -1,45 +1,40 @@
-# RonnaScanner API — Backend Services
+# Ronna Scanner API
 
-Backend API for the **ronnascanner.com** platform. Serverless functions on Vercel.
+Backend for the ronnascanner.com tools. Plain Vercel Node functions (CommonJS).
+Paid-only: every data route needs an active Pro or Team plan. There is no unpaid tier.
+Early access is granted with Stripe promotion codes at checkout.
 
-## Structure
+**Status:** hardened, not deployed. It needs keys (see `.env.example`, names only)
+and the Principal's deploy GO. Deploy with Stripe **test** keys first.
 
-```
-ronnascanner-api/
-├── api/
-│   ├── _middleware/
-│   │   ├── auth.js          # Firebase token verification
-│   │   └── rateLimit.js     # In-memory rate limiter
-│   ├── payment/
-│   │   ├── create-session.js          # Stripe Checkout redirect
-│   │   ├── create-embedded-session.js # Stripe Embedded Checkout
-│   │   ├── webhook.js                 # Stripe webhook → Firestore sync
-│   │   └── portal.js                  # Customer billing portal
-│   └── lib/
-│       └── firebase.js      # Firebase Admin SDK singleton
-├── .env.example             # All secret env vars documented
-├── package.json
-└── vercel.json              # Routes, webhook raw body config, security headers
-```
+## Routes
 
-## Setup
+| Route | Auth | Notes |
+|---|---|---|
+| `POST /api/leads/scan` | Firebase ID token + paid plan | Apollo company search. Fields come from Apollo or are `null`. No invented score. |
+| `POST /api/emails/find` | Firebase ID token + paid plan | Hunter email finder (`mode: "find"`). `verify` and `bulk` return 501 (not built). |
+| `POST /api/contacts/find` | none | **501, not built yet** |
+| `POST /api/companies/scan` | none | **501, not built yet** |
+| `POST /api/prospects/research` | none | **501, not built yet** |
+| `POST /api/payment/create-session` | Firebase ID token | Stripe Checkout redirect. `{ priceId: "pro" \| "team", tool? }` |
+| `POST /api/payment/create-embedded-session` | Firebase ID token | Stripe Embedded Checkout, same body |
+| `POST /api/payment/portal` | Firebase ID token | Billing portal for the caller's own account only |
+| `POST /api/payment/webhook` | Stripe signature | Raw-body verified. Writes `subscriptions/{uid}`, deduped by event id. |
+| `GET /health` | none | Booleans only: which env groups are set, plus the Stripe mode |
+
+Anything else, including `/docs` and `/openapi*`, returns a JSON 404.
+
+## Security model
+
+- **CORS:** an explicit allowlist (`https://ronnascanner.com` + the 5 `https://<tool>.ronnascanner.com`). It sends `Vary: Origin`, never reflects an origin, and never sends credentials. The planned hosting proxies each tool's same-origin `/api/*` here with a Vercel rewrite.
+- **Auth:** Firebase ID tokens for project `mdo3d-leads`. Anonymous tokens are refused. Handlers act only on the token's uid; a body or query `userId` that names another account gets a 403.
+- **Checkout:** the price must be `pro` / `team` or an id in `STRIPE_PRO_PRICE_IDS` / `STRIPE_TEAM_PRICE_IDS`. Client amounts and redirect URLs are refused with a 400. Success and cancel pages are fixed at `https://<tool>.ronnascanner.com/success.html` and `/cancel.html`.
+- **Paywall:** `lib/quota.js` `withQuota`. Without an active paid plan the route returns 402 `subscription_required` before any data-provider call. Paid calls are counted in `usage/{uid}_{YYYY-MM}`. Firestore rules must deny client writes to `usage/*` and `subscriptions/*`.
+- **Error contract:** JSON errors use the codes 400 / 401 / 402 / 403 / 404 / 405 / 409 / 413 / 429 / 501 / 502 / 503. Internal messages are never echoed. Rate limits apply to every paid and payment route.
+
+## Tests
 
 ```bash
-cp .env.example .env.local
-# Fill in Firebase Admin credentials, Stripe SECRET keys, and other API keys
-vercel --prod
+npm install
+npm test        # node:test; Stripe, Firebase, Apollo and Hunter are stubbed; no network
 ```
-
-## Security
-
-- Firebase token verification on all protected routes via `requireAuth` middleware
-- Rate limiting on free tier endpoints
-- Stripe webhook signature verification
-- All secrets server-side only — never in frontend code
-- Security headers (CSP, HSTS, X-Frame-Options) applied globally
-
-## Stripe Webhook
-
-Register `https://your-api.vercel.app/api/payment/webhook` in your Stripe Dashboard.
-Events handled: `checkout.session.completed`, `customer.subscription.updated`,
-`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`.
